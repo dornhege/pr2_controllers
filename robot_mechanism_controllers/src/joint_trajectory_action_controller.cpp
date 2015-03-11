@@ -421,6 +421,7 @@ void JointTrajectoryActionController::update()
       {
         if (traj[seg].trajectory_tolerance[j].violated(error[j], v_error[j]))
         {
+          ROS_WARN("JointTrajectoryActionController: PATH_TOLERANCE_VIOLATED");
           if (traj[seg].gh)
             traj[seg].gh->setAborted();
           else if (traj[seg].gh_follow) {
@@ -438,8 +439,11 @@ void JointTrajectoryActionController::update()
       bool inside_goal_constraints = true;
       for (size_t i = 0; i < joints_.size() && inside_goal_constraints; ++i)
       {
-        if (traj[seg].goal_tolerance[i].violated(error[i], v_error[i]))
+        if (traj[seg].goal_tolerance[i].violated(error[i], v_error[i])) {
           inside_goal_constraints = false;
+          ROS_DEBUG_THROTTLE(1.0, "JointTrajectoryActionController: goal constraint violated for %zu, p: %f, v: %f",
+                  i, error[i], v_error[i]);
+        }
       }
 
       if (inside_goal_constraints)
@@ -456,11 +460,22 @@ void JointTrajectoryActionController::update()
       }
       else if (time < end_time + ros::Duration(traj[seg].goal_time_tolerance))
       {
+          ROS_DEBUG_THROTTLE(0.5, "JointTrajectoryActionController: Goal seg time: %f -> max %f (+ %f), dt: %f",
+                  time.toSec(), end_time.toSec(), traj[seg].goal_time_tolerance,
+                  traj[seg].goal_time_tolerance + end_time.toSec() - time.toSec());
         // Still have some time left to make it.
       }
       else
       {
-        //ROS_WARN("Aborting because we wound up outside the goal constraints");
+        ROS_WARN("JointTrajectoryActionController: Aborting because we wound up outside the goal constraints");
+        for (size_t i = 0; i < joints_.size(); ++i)
+        {
+            if (traj[seg].goal_tolerance[i].violated(error[i], v_error[i])) {
+                ROS_INFO("JointTrajectoryActionController: goal constraint violated for %zu, p: %f, v: %f",
+                        i, error[i], v_error[i]);
+            }
+        }
+
         rt_active_goal_.reset();
         rt_active_goal_follow_.reset();
         if (traj[seg].gh)
