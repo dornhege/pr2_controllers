@@ -198,6 +198,30 @@ private:
     result.reached_goal = false;
     result.stalled = false;
 
+    // Compute process_value_dot by differentiating process_value over time
+    static double last_process_value = HUGE_VAL;
+    static ros::Time last_process_value_time;
+    double process_value_dot_by_diff = HUGE_VAL;
+    if(last_process_value == HUGE_VAL) {
+        process_value_dot_by_diff = msg->process_value_dot;
+    } else {
+        process_value_dot_by_diff = msg->process_value - last_process_value;
+        process_value_dot_by_diff /= (ros::Time::now() - last_process_value_time).toSec();
+    }
+    last_process_value = msg->process_value;
+    last_process_value_time = ros::Time::now();
+
+    double joint_velocity = msg->process_value_dot;
+    ROS_DEBUG("gripper_action: delta pos: %f / %f, delta v: %f (%f) / %f, no movement time: %f / %f",
+        fabs(msg->process_value - active_goal_.getGoal()->command.position), goal_threshold_,
+        msg->process_value_dot, process_value_dot_by_diff, stall_velocity_threshold_,
+        (ros::Time::now() - last_movement_time_).toSec(), stall_timeout_);
+    if(fabs(msg->process_value_dot - process_value_dot_by_diff) > 0.01) {
+        ROS_WARN_THROTTLE(0.5, "gripper_action: velocity discrepancy, reported: %f by diff: %f - using diff",
+                msg->process_value_dot, process_value_dot_by_diff);
+        joint_velocity = process_value_dot_by_diff;
+    }
+
     if (fabs(msg->process_value - active_goal_.getGoal()->command.position) < goal_threshold_)
     {
       feedback.reached_goal = true;
@@ -208,8 +232,11 @@ private:
     }
     else
     {
+      ROS_DEBUG("gripper_action: stalling: %d for %f", fabs(joint_velocity) <= stall_velocity_threshold_,
+              (ros::Time::now() - last_movement_time_).toSec());
+
       // Determines if the gripper has stalled.
-      if (fabs(msg->process_value_dot) > stall_velocity_threshold_)
+      if (fabs(joint_velocity) > stall_velocity_threshold_)
       {
         last_movement_time_ = ros::Time::now();
       }
