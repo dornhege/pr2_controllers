@@ -55,6 +55,7 @@ public:
     pn.param("goal_threshold", goal_threshold_, 0.01);
     pn.param("stall_velocity_threshold", stall_velocity_threshold_, 1e-6);
     pn.param("stall_timeout", stall_timeout_, 0.1);
+    pn.param("joint_velocity_by_averaging_diffs", joint_velocity_by_averaging_diffs_, false);
 
     pub_controller_command_ =
       node_.advertise<pr2_controllers_msgs::Pr2GripperCommand>("command", 1);
@@ -88,7 +89,10 @@ private:
   double goal_threshold_;
   double stall_velocity_threshold_;
   double stall_timeout_;
+  bool joint_velocity_by_averaging_diffs_;
   ros::Time last_movement_time_;
+
+  std::vector< std::pair<double, ros::Time> > process_values_dot_diff_;
 
   void watchdog(const ros::TimerEvent &e)
   {
@@ -160,6 +164,64 @@ private:
   }
 
 
+  /// Determine the gripper velocity
+  /**
+   * Usually this is just a param in the message, but due to gazebo's simulation jitter
+   * that might be in the order of magnitude of actual movement, it might be preferable
+   * to determine the by differentiating and averaging the position.
+   */
+  double determineJointVelocity(const pr2_controllers_msgs::JointControllerStateConstPtr & msg)
+  {
+    if(!joint_velocity_by_averaging_diffs_) {
+        return msg->process_value_dot;
+    }
+
+    // Compute process_value_dot by differentiating process_value over time
+    static double last_process_value = HUGE_VAL;
+    static ros::Time last_process_value_time;
+
+    ros::Time now = ros::Time::now();
+
+    // 1. determine process_value_dot_by_diff by diffing to last
+    double process_value_dot_by_diff = HUGE_VAL;
+    if(last_process_value == HUGE_VAL) {
+        process_value_dot_by_diff = msg->process_value_dot;
+    } else {
+        process_value_dot_by_diff = msg->process_value - last_process_value;
+        process_value_dot_by_diff /= (now - last_process_value_time).toSec();
+    }
+    last_process_value = msg->process_value;
+    last_process_value_time = now;
+
+    // 2. average process_value_dot_by_diff in a window
+    process_values_dot_diff_.push_back(std::make_pair(process_value_dot_by_diff, now));
+    // filter to keep only a window
+    std::vector<std::pair<double, ros::Time> >::iterator first_valid = process_values_dot_diff_.begin();
+    while(now - first_valid->second > ros::Duration(0.5)) {
+        ++first_valid;
+    }
+    process_values_dot_diff_.erase(process_values_dot_diff_.begin(), first_valid);
+    // now and current inserted one should be same, so this never is empty
+    ROS_ASSERT(!process_values_dot_diff_.empty());
+    double process_values_dot_diff_avg = 0.0;
+    for(std::vector<std::pair<double, ros::Time> >::iterator it = process_values_dot_diff_.begin();
+            it != process_values_dot_diff_.end(); ++it) {
+        process_values_dot_diff_avg += it->first;
+    }
+    process_values_dot_diff_avg /= process_values_dot_diff_.size();
+
+    // 3. Determine what we actually use and warn if this mattered (for debugging)
+    double joint_velocity = process_values_dot_diff_avg;
+    ROS_DEBUG("gripper_action: delta pos: %f / %f, delta v: %f (%f, avg: %f) / %f, no movement time: %f / %f",
+        fabs(msg->process_value - active_goal_.getGoal()->command.position), goal_threshold_,
+        msg->process_value_dot, process_value_dot_by_diff, process_values_dot_diff_avg, stall_velocity_threshold_,
+        (now - last_movement_time_).toSec(), stall_timeout_);
+    if(fabs(msg->process_value_dot - joint_velocity) > 0.01) {
+        ROS_WARN_THROTTLE(0.5, "gripper_action: velocity discrepancy, reported: %f by diff: %f - using diff",
+                msg->process_value_dot, joint_velocity);
+    }
+    return joint_velocity;
+  }
 
   pr2_controllers_msgs::JointControllerStateConstPtr last_controller_state_;
   void controllerStateCB(const pr2_controllers_msgs::JointControllerStateConstPtr &msg)
@@ -185,7 +247,6 @@ private:
       }
     }
 
-
     pr2_controllers_msgs::Pr2GripperCommandFeedback feedback;
     feedback.position = msg->process_value;
     feedback.effort = msg->command;
@@ -198,30 +259,6 @@ private:
     result.reached_goal = false;
     result.stalled = false;
 
-    // Compute process_value_dot by differentiating process_value over time
-    static double last_process_value = HUGE_VAL;
-    static ros::Time last_process_value_time;
-    double process_value_dot_by_diff = HUGE_VAL;
-    if(last_process_value == HUGE_VAL) {
-        process_value_dot_by_diff = msg->process_value_dot;
-    } else {
-        process_value_dot_by_diff = msg->process_value - last_process_value;
-        process_value_dot_by_diff /= (ros::Time::now() - last_process_value_time).toSec();
-    }
-    last_process_value = msg->process_value;
-    last_process_value_time = ros::Time::now();
-
-    double joint_velocity = msg->process_value_dot;
-    ROS_DEBUG("gripper_action: delta pos: %f / %f, delta v: %f (%f) / %f, no movement time: %f / %f",
-        fabs(msg->process_value - active_goal_.getGoal()->command.position), goal_threshold_,
-        msg->process_value_dot, process_value_dot_by_diff, stall_velocity_threshold_,
-        (ros::Time::now() - last_movement_time_).toSec(), stall_timeout_);
-    if(fabs(msg->process_value_dot - process_value_dot_by_diff) > 0.01) {
-        ROS_WARN_THROTTLE(0.5, "gripper_action: velocity discrepancy, reported: %f by diff: %f - using diff",
-                msg->process_value_dot, process_value_dot_by_diff);
-        joint_velocity = process_value_dot_by_diff;
-    }
-
     if (fabs(msg->process_value - active_goal_.getGoal()->command.position) < goal_threshold_)
     {
       feedback.reached_goal = true;
@@ -232,15 +269,16 @@ private:
     }
     else
     {
+      double joint_velocity = determineJointVelocity(msg);
       ROS_DEBUG("gripper_action: stalling: %d for %f", fabs(joint_velocity) <= stall_velocity_threshold_,
-              (ros::Time::now() - last_movement_time_).toSec());
+              (now - last_movement_time_).toSec());
 
       // Determines if the gripper has stalled.
       if (fabs(joint_velocity) > stall_velocity_threshold_)
       {
-        last_movement_time_ = ros::Time::now();
+        last_movement_time_ = now;
       }
-      else if ((ros::Time::now() - last_movement_time_).toSec() > stall_timeout_ &&
+      else if ((now - last_movement_time_).toSec() > stall_timeout_ &&
                active_goal_.getGoal()->command.max_effort != 0.0)
       {
         feedback.stalled = true;
